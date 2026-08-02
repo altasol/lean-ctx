@@ -75,7 +75,26 @@ fn should_allow(tool_name: &str, file_path: Option<&str>) -> bool {
 }
 
 fn is_lean_ctx_tool(tool_name: &str) -> bool {
-    tool_name.starts_with("ctx_") || tool_name == "shell"
+    tool_name.starts_with("ctx_") || tool_name == "shell" || is_mcp_wrapper(tool_name)
+}
+
+/// Recognise MCP wrapper tool names that carry the real tool name in
+/// `input.tool_name` (Devin's `mcp_call_tool` and client-namespaced variants).
+///
+/// The deny hook's scope is native-tool redirection (Read/Grep/Glob/Shell →
+/// ctx_*). `mcp_call_tool` is Devin's MCP bridge: its inner tool_name is
+/// always an MCP tool (ctx_*, linear, github, wallaby, ...), never a native
+/// Read. Allowing the wrapper unconditionally cannot bypass the deny hook
+/// because native tools are not reachable through it. See GH #1329.
+fn is_mcp_wrapper(tool_name: &str) -> bool {
+    let bare = tool_name
+        .rsplit("__")
+        .next()
+        .unwrap_or(tool_name)
+        .rsplit([':', '/'])
+        .next()
+        .unwrap_or(tool_name);
+    bare == "mcp_call_tool" || bare == "mcp_call_tool_with_request_id"
 }
 
 fn is_mcp_server_reachable() -> bool {
@@ -533,6 +552,27 @@ mod tests {
         assert!(!is_lean_ctx_tool("Read"));
         assert!(!is_lean_ctx_tool("Grep"));
         assert!(!is_lean_ctx_tool("Shell"));
+    }
+
+    #[test]
+    fn is_mcp_wrapper_recognises_devin_and_namespaced_variants() {
+        assert!(is_mcp_wrapper("mcp_call_tool"));
+        assert!(is_mcp_wrapper("mcp_call_tool_with_request_id"));
+        assert!(is_mcp_wrapper("mcp__lean-ctx__mcp_call_tool"));
+        assert!(is_mcp_wrapper("client:mcp_call_tool"));
+        assert!(is_mcp_wrapper("client/mcp_call_tool"));
+        assert!(!is_mcp_wrapper("Read"));
+        assert!(!is_mcp_wrapper("ctx_read"));
+        assert!(!is_mcp_wrapper("mcp_call_tool_other"));
+    }
+
+    #[test]
+    fn is_lean_ctx_tool_allows_mcp_wrapper_unconditionally() {
+        // The inner tool_name (ctx_*, linear, github, ...) is opaque to the
+        // deny hook; the wrapper itself is always an MCP bridge, never a
+        // native Read/Grep/Glob/Shell, so it is whitelisted unconditionally.
+        assert!(is_lean_ctx_tool("mcp_call_tool"));
+        assert!(is_lean_ctx_tool("mcp__lean-ctx__mcp_call_tool"));
     }
 
     #[test]
