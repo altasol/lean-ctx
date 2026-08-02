@@ -1,11 +1,104 @@
 use rusqlite::{Connection, params};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Mutex, OnceLock};
 
 use super::data_dir::lean_ctx_data_dir;
 
-static DB: std::sync::LazyLock<Mutex<Option<Connection>>> =
-    std::sync::LazyLock::new(|| Mutex::new(open_db()));
+// ── Background writer ──────────────────────────────────────────────────────
+//
+// The archive FTS database is a write-heavy, read-rarely store.  Opening it
+// (`Connection::open` + `PRAGMA journal_mode=WAL` + DDL) can block for seconds
+// when stale processes hold the `-shm` lock.  To keep the MCP server responsive
+// we defer the DB open to a dedicated background thread and send all writes
+// through an `mpsc` channel — callers of `index_entry` / `remove_entry` /
+// `enforce_cap` never block on SQLite.
+//
+// Reads (`search`, `entry_count`) use a separate read-only connection that
+// skips the WAL pragma entirely, so they never contend with the writer.
+
+enum DbCommand {
+    Index {
+        archive_id: String,
+        tool: String,
+        command: String,
+        content: String,
+    },
+    Remove {
+        archive_id: String,
+    },
+    EnforceCap,
+}
+
+struct WriterHandle {
+    tx: Sender<DbCommand>,
+}
+
+impl WriterHandle {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel::<DbCommand>();
+        std::thread::Builder::new()
+            .name("archive-fts-writer".into())
+            .spawn(move || {
+                let Some(conn) = open_db() else {
+                    return; // DB open failed; writer exits, commands are dropped
+                };
+                for cmd in rx {
+                    match cmd {
+                        DbCommand::Index {
+                            archive_id,
+                            tool,
+                            command,
+                            content,
+                        } => {
+                            index_entry_locked(&conn, &archive_id, &tool, &command, &content);
+                        }
+                        DbCommand::Remove { archive_id } => {
+                            remove_entry_locked(&conn, &archive_id);
+                        }
+                        DbCommand::EnforceCap => {
+                            enforce_cap_locked(&conn);
+                        }
+                    }
+                }
+            })
+            .ok();
+        WriterHandle { tx }
+    }
+
+    fn send(&self, cmd: DbCommand) {
+        let _ = self.tx.send(cmd);
+    }
+}
+
+static WRITER: OnceLock<WriterHandle> = OnceLock::new();
+
+fn writer() -> &'static WriterHandle {
+    WRITER.get_or_init(WriterHandle::new)
+}
+
+// ── Read connection (query-only, no WAL pragma) ────────────────────────────
+
+static READ_DB: std::sync::LazyLock<Mutex<Option<Connection>>> =
+    std::sync::LazyLock::new(|| Mutex::new(open_read_db()));
+
+/// Open a read-only connection.  Skips `PRAGMA journal_mode=WAL` (the
+/// contentious operation) — the DB file header already records WAL mode once
+/// the writer has initialised it, so a reader inherits it for free.  If the DB
+/// file does not exist yet the read simply returns `None` and callers fall
+/// back to empty results.
+fn open_read_db() -> Option<Connection> {
+    let path = db_path();
+    if !path.exists() {
+        return None;
+    }
+    let conn = Connection::open(&path).ok()?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    let _ = conn.execute_batch("PRAGMA query_only=ON;");
+    Some(conn)
+}
+
+// ── Constants ──────────────────────────────────────────────────────────────
 
 /// Default maximum on-disk size for the archive FTS database. Overridable via
 /// `LEAN_CTX_ARCHIVE_DB_MAX_MB`. Without enforcement this DB grew unbounded
@@ -94,12 +187,43 @@ fn open_db() -> Option<Connection> {
     Some(conn)
 }
 
-pub(crate) fn index_entry(archive_id: &str, tool: &str, command: &str, content: &str) {
-    let guard = DB.lock().ok();
-    let Some(conn) = guard.as_ref().and_then(|g| g.as_ref()) else {
-        return;
-    };
+// ── Write operations (non-blocking, sent to background writer) ─────────────
 
+/// Index an archive entry.  Non-blocking: the write is enqueued to the
+/// background writer thread and the caller returns immediately.
+pub(crate) fn index_entry(archive_id: &str, tool: &str, command: &str, content: &str) {
+    writer().send(DbCommand::Index {
+        archive_id: archive_id.to_string(),
+        tool: tool.to_string(),
+        command: command.to_string(),
+        content: content.to_string(),
+    });
+}
+
+/// Remove an archive entry.  Non-blocking.
+pub(crate) fn remove_entry(archive_id: &str) {
+    writer().send(DbCommand::Remove {
+        archive_id: archive_id.to_string(),
+    });
+}
+
+/// Enforce the on-disk size cap.  Non-blocking: the enforcement runs in the
+/// background writer; the returned byte count is the current size (may not
+/// yet reflect the cleanup, which is acceptable for best-effort reporting).
+pub(crate) fn enforce_cap() -> u64 {
+    writer().send(DbCommand::EnforceCap);
+    db_size_bytes()
+}
+
+// ── Locked write helpers (run on the writer thread) ────────────────────────
+
+fn index_entry_locked(
+    conn: &Connection,
+    archive_id: &str,
+    tool: &str,
+    command: &str,
+    content: &str,
+) {
     let exists: bool = conn
         .query_row(
             "SELECT 1 FROM archive_meta WHERE archive_id = ?1",
@@ -182,22 +306,7 @@ fn enforce_cap_locked(conn: &Connection) {
     }
 }
 
-/// Public entry point to enforce the archive DB size cap on demand (e.g. from
-/// idle maintenance or `doctor`). Returns the resulting size in bytes.
-pub(crate) fn enforce_cap() -> u64 {
-    if let Ok(guard) = DB.lock()
-        && let Some(conn) = guard.as_ref()
-    {
-        enforce_cap_locked(conn);
-    }
-    db_size_bytes()
-}
-
-pub(crate) fn remove_entry(archive_id: &str) {
-    let guard = DB.lock().ok();
-    let Some(conn) = guard.as_ref().and_then(|g| g.as_ref()) else {
-        return;
-    };
+fn remove_entry_locked(conn: &Connection, archive_id: &str) {
     let _ = conn.execute(
         "DELETE FROM archive_meta WHERE archive_id = ?1",
         params![archive_id],
@@ -207,6 +316,8 @@ pub(crate) fn remove_entry(archive_id: &str) {
         params![archive_id],
     );
 }
+
+// ── Read operations (separate read-only connection) ────────────────────────
 
 #[derive(Debug, Clone)]
 pub(crate) struct FtsResult {
@@ -218,7 +329,7 @@ pub(crate) struct FtsResult {
 }
 
 pub(crate) fn search(query: &str, limit: usize) -> Vec<FtsResult> {
-    let guard = DB.lock().ok();
+    let guard = READ_DB.lock().ok();
     let Some(conn) = guard.as_ref().and_then(|g| g.as_ref()) else {
         return Vec::new();
     };
@@ -248,7 +359,7 @@ pub(crate) fn search(query: &str, limit: usize) -> Vec<FtsResult> {
 }
 
 pub(crate) fn entry_count() -> usize {
-    let guard = DB.lock().ok();
+    let guard = READ_DB.lock().ok();
     let Some(conn) = guard.as_ref().and_then(|g| g.as_ref()) else {
         return 0;
     };
