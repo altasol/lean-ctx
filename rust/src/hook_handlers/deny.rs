@@ -16,14 +16,6 @@ const BINARY_EXTENSIONS: &[&str] = &[
 /// Output format matches both Claude Code and Cursor hook protocols.
 pub fn handle_deny() {
     let stdin_payload = read_stdin_with_timeout();
-    // Debug aid: dump the raw hook payload so unknown tool_name shapes
-    // (e.g. Devin's MCP wrapper) can be inspected. All current builds are
-    // debug-only, so dump unconditionally. Written to ~/dev/altasol/ to
-    // avoid sandbox/jail write restrictions on /tmp and config dirs.
-    if let Some(home) = dirs::home_dir() {
-        let out = home.join("dev/altasol/deny-payload.json");
-        let _ = std::fs::write(&out, &stdin_payload);
-    }
     let tool_name = extract_tool_name(&stdin_payload);
     let file_path = extract_file_path(&stdin_payload);
 
@@ -312,18 +304,7 @@ fn smart_deny_message(tool_name: &str, payload: &str) -> String {
         "Grep" | "grep" | "Search" => build_ctx_search_hint(&args),
         "Glob" | "glob" | "list_dir" => build_ctx_glob_hint(&args),
         "Shell" | "Bash" | "bash" | "run_terminal_command" => build_ctx_shell_hint(&args),
-        _ => {
-            // Include a prefix of the raw payload so unknown tool_name shapes
-            // (e.g. Devin's MCP wrapper) can be diagnosed from the deny message
-            // alone. Truncate to keep the message LLM-friendly.
-            let prefix: String = payload.chars().take(300).collect();
-            format!(
-                "[DENIED] tool_name=\"{tool_name}\" blocked. Use the equivalent ctx_* tool — \
-                 lean-ctx replace mode is active. (If this is an MCP wrapper, report \
-                 this tool_name so is_mcp_wrapper can be extended.) \
-                 payload_prefix={prefix}"
-            )
-        }
+        _ => "Use the equivalent ctx_* tool — lean-ctx replace mode is active.".to_string(),
     }
 }
 
