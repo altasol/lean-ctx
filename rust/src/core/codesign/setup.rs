@@ -96,6 +96,10 @@ fn create_and_trust(
     )?;
 
     // 2. Bundle key + cert into a PKCS#12 protected by the keychain password.
+    // `-legacy` is required on OpenSSL 3.x: the default PKCS12 MAC algorithm
+    // changed (SHA-256 + PBES2), which macOS `security import` cannot read
+    // ("MAC verification failed during PKCS12 import"). `-legacy` restores the
+    // SHA-1 + RC2-40 format that macOS expects (GH #356 regression on 3.x).
     run(
         "openssl",
         &[
@@ -109,6 +113,7 @@ fn create_and_trust(
             &p12s,
             "-passout",
             &format!("pass:{pw}"),
+            "-legacy",
         ],
     )?;
 

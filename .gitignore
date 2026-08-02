@@ -86,3 +86,4 @@ ts-sdk/node_modules/
 *.kt
 .worktrees/
 .worktrees/
+rust/.codesign/
