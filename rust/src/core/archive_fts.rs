@@ -40,8 +40,22 @@ impl WriterHandle {
         std::thread::Builder::new()
             .name("archive-fts-writer".into())
             .spawn(move || {
-                let Some(conn) = open_db() else {
-                    return; // DB open failed; writer exits, commands are dropped
+                // Retry the DB open with exponential backoff.  The writer thread
+                // stays alive across open failures so the channel (and its
+                // senders) is never disconnected — commands buffer in the
+                // unbounded mpsc channel until the DB comes online, instead of
+                // being dropped.  Callers of index_entry / remove_entry /
+                // enforce_cap never block: mpsc::send is O(1) and cannot fail
+                // while the receiver lives.  Backoff starts fast (the failure is
+                // often a transient `-shm` lock) and caps at 3 minutes so a
+                // permanently-broken DB does not spin a core.
+                let mut backoff = OPEN_BACKOFF_START;
+                let conn = loop {
+                    if let Some(c) = open_db() {
+                        break c;
+                    }
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(OPEN_BACKOFF_MAX);
                 };
                 for cmd in rx {
                     match cmd {
@@ -99,6 +113,15 @@ fn open_read_db() -> Option<Connection> {
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────
+
+/// Initial backoff for retrying `open_db()` on the writer thread.  The failure
+/// is often a transient `-shm` lock held by a stale process, so we start fast.
+const OPEN_BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Maximum wait between `open_db()` retries.  Caps at 3 minutes so a
+/// permanently-broken DB does not spin a core, while still allowing recovery
+/// from outages that resolve within minutes (e.g. a stale daemon exiting).
+const OPEN_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_mins(3);
 
 /// Default maximum on-disk size for the archive FTS database. Overridable via
 /// `LEAN_CTX_ARCHIVE_DB_MAX_MB`. Without enforcement this DB grew unbounded
